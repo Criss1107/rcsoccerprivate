@@ -1,38 +1,61 @@
 from base_player import BasePlayer
 import sys
-import random
 from perception import World, dist_between
 
-KICKABLE = 1.0 #alcance de pateo aprox
-SHOOT_RANGE = 25.0 #distancia maxima a porteria para tirar
-SEARCH_TURN = 60 #grados al buscar la pelota
+KICKABLE = 1.0       # alcance de pateo aprox
+SHOOT_RANGE = 25.0   # distancia maxima a la porteria para tirar
+SEARCH_TURN = 60     # grados al buscar la pelota
+RECEIVER = 7         # receptor designado tras un saque inicial propio
+RECEIVER_CYCLES = 120
+
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
+
 class Attacker(BasePlayer):
     """FSM: SEARCH -> CHASE -> (SHOOT | PASS | DRIBBLE) ; SUPPORT si otro es mas cercano."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.wait = 0   # ciclos de espera tras patear en una jugada parada
+
     def decide(self, w: World):
         ball = w.ball
+        if self.wait > 0:
+            self.wait -= 1
         if ball is None:
             self.set_state("SEARCH")
             return self.send(f"(turn {SEARCH_TURN})")
- 
-        #posesion: pelota al alcance
+
+        # posesion pelota al alcance
         if ball.dist <= KICKABLE:
+            self.m["possession_cycles"] += 1
+            if self.wait > 0:
+                # el cobrador no puede tocar la pelota dos veces seguidas en un saque o si es falta se queda quieto hasta que la toque otro jugador
+                self.set_state("SUPPORT")
+                return self.send(f"(turn {ball.dir:.0f})")
+            if not self.play_mode.startswith("play_on"):
+                self.wait = 60   # saque inicial o jugada parada: un solo toque
             return self.with_ball(w)
- 
-        # --- Cooperacion: solo persigue el mas cercano a la pelota ---
-        closer_mate = any(m.dist < ball.dist - 1.0 for m in w.mates
-                          if dist_between(m, ball) < ball.dist)
-        if closer_mate:
+
+        if self.wait > 0:
             self.set_state("SUPPORT")
             return self.support(w)
- 
+
+        #Cooperacion solo persigue el companero mas cercano a la pelota 
+        # (distancia companero-pelota por ley de cosenos)
+        closer_mate = any(dist_between(m, ball) < ball.dist - 1.0 for m in w.mates)
+        # despues de nuestro saque, el receptor designado va por la pelota aunque el cobrador este mas cerca: asi otro jugador la toca primero (sin falta)
+        receiver = (self.number == RECEIVER and
+                    self.m["cycles"] - self.kickoff_cycle < RECEIVER_CYCLES)
+        if closer_mate and not receiver:
+            self.set_state("SUPPORT")
+            return self.support(w)
+
         self.set_state("CHASE")
         return self.go_to(ball, 100 if (w.stamina or 8000) > 1500 else 60)
- 
-    # ------------------------------------------------------------
+
     def with_ball(self, w: World):
         goal = w.opp_goal
         if goal is not None and goal.dist <= SHOOT_RANGE:
@@ -40,8 +63,8 @@ class Attacker(BasePlayer):
             self.m["kicks"] += 1
             self.m["shots"] += 1
             return self.send(f"(kick 100 {goal.dir:.0f})")
- 
-        # pase: companero adelantado (mas cerca de la porteria rival) y libre
+
+        # pase compañero adelantado (mas cerca de la porteria rival) y libre
         target = self.best_pass(w)
         if target is not None:
             self.set_state("PASS")
@@ -49,12 +72,21 @@ class Attacker(BasePlayer):
             self.m["passes"] += 1
             power = clamp(target.dist * 2.5 + 10, 30, 100)  # a calibrar
             return self.send(f"(kick {power:.0f} {target.dir:.0f})")
- 
+
+        if not self.play_mode.startswith("play_on"):
+            # saque inicial / jugada parada sin pase posible: patada larga hacia adelante para que otro jugador la toque primero (evita la falta)
+            self.set_state("KICKOFF")
+            self.m["kicks"] += 1
+            d = goal.dir if goal is not None else 0
+            return self.send(f"(kick 100 {d:.0f})")
+
         self.set_state("DRIBBLE")
+        if goal is None:
+            # sin ver la porteria rival e ntonces girar hasta encontrarla
+            return self.send("(turn 45)")
         self.m["kicks"] += 1
-        d = goal.dir if goal is not None else 0
-        return self.send(f"(kick 25 {d:.0f})")
- 
+        return self.send(f"(kick 30 {goal.dir:.0f})")
+
     def best_pass(self, w: World):
         goal = w.opp_goal
         if goal is None:
@@ -70,34 +102,16 @@ class Attacker(BasePlayer):
             if free and gain > best_gap:
                 best, best_gap = m, gain
         return best
- 
+
     def support(self, w: World):
-        """Sin pelota: orientarse a la pelota y avanzar hacia la porteria rival."""
+        """Sin pelota orientarse a la pelota y avanzar hacia la porteria rival."""
         ball = w.ball
         if abs(ball.dir) > 25:
             return self.send(f"(turn {ball.dir:.0f})")
-        if w.opp_goal is not None and w.opp_goal.dist > 20:
+        if w.opp_goal is None or w.opp_goal.dist > 20:
             return self.send("(dash 60)")
-        return self.send("(turn 0)")
- 
-    def go_to(self, obj, power):
-        if abs(obj.dir) > 10:
-            return self.send(f"(turn {obj.dir:.0f})")
-        return self.send(f"(dash {power})")
+        return self.send(f"(turn {ball.dir:.0f})")
 
-    """def play(self):
-        Atacantes avanzan hacia la portería rival
-        ACTIONS = ["turn_left", "turn_right", "dash", "kick"]
-        action = random.choice(ACTIONS)
-        if action == "turn_left":
-            self.send("(turn -45)")
-        elif action == "turn_right":
-            self.send("(turn 45)")
-        elif action == "dash":
-            self.send("(dash 60)")
-        elif action == "kick":
-            self.send("(kick 80 0)")
-"""
 
 if __name__ == "__main__":
     number = int(sys.argv[1])
